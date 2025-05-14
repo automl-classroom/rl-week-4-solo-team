@@ -59,6 +59,7 @@ class DQNAgent(AbstractAgent):
         epsilon_decay: int = 500,
         target_update_freq: int = 1000,
         seed: int = 0,
+        hidden_dims: List[int] = [64, 64],
     ) -> None:
         """
         Initialize replay buffer, Q-networks, optimizer, and hyperparameters.
@@ -85,6 +86,8 @@ class DQNAgent(AbstractAgent):
             How many updates between target-network syncs.
         seed : int
             RNG seed.
+        hidden_dims : List[int]
+            List of sizes for each hidden layer in the Q-network.
         """
         super().__init__(
             env,
@@ -105,8 +108,8 @@ class DQNAgent(AbstractAgent):
         n_actions = env.action_space.n
 
         # main Q-network and frozen target
-        self.q = QNetwork(obs_dim, n_actions)
-        self.target_q = QNetwork(obs_dim, n_actions)
+        self.q = QNetwork(obs_dim, n_actions, hidden_dims=hidden_dims)
+        self.target_q = QNetwork(obs_dim, n_actions, hidden_dims=hidden_dims)
         self.target_q.load_state_dict(self.q.state_dict())
 
         self.optimizer = optim.Adam(self.q.parameters(), lr=lr)
@@ -131,15 +134,14 @@ class DQNAgent(AbstractAgent):
         float
             Exploration rate.
         """
-        # TODO: implement exponential‐decayin
         # ε = ε_final + (ε_start - ε_final) * exp(-total_steps / ε_decay)
-        # Currently, it is constant and returns the starting value ε
+        return float(
+            self.epsilon_final
+            + (self.epsilon_start - self.epsilon_final)
+            * np.exp(-self.total_steps / self.epsilon_decay)
+        )
 
-        return self.epsilon_start
-
-    def predict_action(
-        self, state: np.ndarray, evaluate: bool = False
-    ) -> Tuple[int, Dict]:
+    def predict_action(self, state: np.ndarray, evaluate: bool = False) -> int:
         """
         Choose action via ε-greedy (or purely greedy in eval mode).
 
@@ -155,23 +157,20 @@ class DQNAgent(AbstractAgent):
         Returns
         -------
         action : int
-        info_out : dict
-            Empty dict (compatible with interface).
         """
         if evaluate:
             # TODO: select purely greedy action from Q(s)
-            with torch.no_grad():
-                qvals = ...  # noqa: F841
-
-            action = None
+            return self._get_best_action(state, evaluate)
         else:
             if np.random.rand() < self.epsilon():
-                # TODO: sample random action
-                action = None
+                return self.env.action_space.sample()
             else:
-                # TODO: select purely greedy action from Q(s)
-                action = None
+                return self._get_best_action(state, evaluate)
 
+    def _get_best_action(self, state: np.ndarray, evaluate: bool = False) -> int:
+        with torch.no_grad():
+            qvals = self.q(torch.tensor(state, dtype=torch.float32))
+            action = int(torch.argmax(qvals).item())
         return action
 
     def save(self, path: str) -> None:
@@ -221,19 +220,28 @@ class DQNAgent(AbstractAgent):
             MSE loss value.
         """
         # unpack
-        states, actions, rewards, next_states, dones, _ = zip(*training_batch)  # noqa: F841
+        states, actions, rewards, next_states, dones, _ = zip(
+            *training_batch
+        )  # noqa: F841
         s = torch.tensor(np.array(states), dtype=torch.float32)  # noqa: F841
-        a = torch.tensor(np.array(actions), dtype=torch.int64).unsqueeze(1)  # noqa: F841
+        a = torch.tensor(np.array(actions), dtype=torch.int64).unsqueeze(
+            1
+        )  # noqa: F841
         r = torch.tensor(np.array(rewards), dtype=torch.float32)  # noqa: F841
         s_next = torch.tensor(np.array(next_states), dtype=torch.float32)  # noqa: F841
         mask = torch.tensor(np.array(dones), dtype=torch.float32)  # noqa: F841
 
-        # # TODO: pass batched states through self.q and gather Q(s,a)
-        pred = ...
+        pred = self.q(s).gather(1, a)
 
-        # TODO: compute TD target with frozen network
+        # Compute TD target with frozen network
         with torch.no_grad():
-            target = ...
+            q_next_target = self.target_q(s_next)
+            max_q_next = q_next_target.max(1)[0]
+
+            td_target_values = r + self.gamma * (1 - mask) * max_q_next
+
+            # Reshape td_target_values to [batch_size, 1] to match pred's shape
+            target = td_target_values.unsqueeze(1)
 
         loss = nn.MSELoss()(pred, target)
 
@@ -249,7 +257,9 @@ class DQNAgent(AbstractAgent):
         self.total_steps += 1
         return float(loss.item())
 
-    def train(self, num_frames: int, eval_interval: int = 1000) -> None:
+    def train(
+        self, num_frames: int, eval_interval: int = 1000
+    ) -> Tuple[List[int], List[float]]:
         """
         Run a training loop for a fixed number of frames.
 
@@ -258,11 +268,21 @@ class DQNAgent(AbstractAgent):
         num_frames : int
             Total environment steps.
         eval_interval : int
-            Every this many episodes, print average reward.
+            Every this many episodes, print average reward. (Currently, logging is fixed at every 10 episodes)
+
+        Returns
+        -------
+        frames_log : List[int]
+            List of frame numbers at which average reward was logged.
+        avg_rewards_log : List[float]
+            List of average rewards logged.
         """
         state, _ = self.env.reset()
         ep_reward = 0.0
         recent_rewards: List[float] = []
+
+        frames_log: List[int] = []
+        avg_rewards_log: List[float] = []
 
         for frame in range(1, num_frames + 1):
             action = self.predict_action(state)
@@ -275,8 +295,7 @@ class DQNAgent(AbstractAgent):
 
             # update if ready
             if len(self.buffer) >= self.batch_size:
-                # TODO: sample a batch from replay buffer
-                batch = ...
+                batch = self.buffer.sample(self.batch_size)
                 _ = self.update_agent(batch)
 
             if done or truncated:
@@ -284,25 +303,136 @@ class DQNAgent(AbstractAgent):
                 recent_rewards.append(ep_reward)
                 ep_reward = 0.0
                 # logging
-                if len(recent_rewards) % 10 == 0:
-                    # TODO: compute avg over last eval_interval episodes and print
-                    avg = ...
+                if len(recent_rewards) >= 10 and len(recent_rewards) % 10 == 0:
+                    avg = np.mean(recent_rewards[-10:])
                     print(
                         f"Frame {frame}, AvgReward(10): {avg:.2f}, ε={self.epsilon():.3f}"
                     )
+                    frames_log.append(frame)
+                    avg_rewards_log.append(avg)
 
         print("Training complete.")
+        return frames_log, avg_rewards_log
 
 
 @hydra.main(config_path="../configs/agent/", config_name="dqn", version_base="1.1")
 def main(cfg: DictConfig):
-    # 1) build env
-    env = gym.make(cfg.env.name)
-    set_seed(env, cfg.seed)
+    import os
+    import matplotlib.pyplot as plt
 
-    # 3) TODO: instantiate & train the agent
-    agent = ...
-    agent.train(...)
+    experiment_configurations = [
+        {
+            "hidden_dims": [64, 64],
+            "batch_size": 32,
+            "buffer_capacity": 10000,
+            "label": "h[64,64]_b32_c10k",
+        },
+        {
+            "hidden_dims": [32],
+            "batch_size": 32,
+            "buffer_capacity": 10000,
+            "label": "h[32]_b32_c10k",
+        },
+        {
+            "hidden_dims": [128, 128],
+            "batch_size": 32,
+            "buffer_capacity": 10000,
+            "label": "h[128,128]_b32_c10k",
+        },
+        {
+            "hidden_dims": [64, 64, 64],
+            "batch_size": 32,
+            "buffer_capacity": 10000,
+            "label": "h[64,64,64]_b32_c10k",
+        },
+        {
+            "hidden_dims": [64, 64],
+            "batch_size": 16,
+            "buffer_capacity": 10000,
+            "label": "h[64,64]_b16_c10k",
+        },
+        {
+            "hidden_dims": [64, 64],
+            "batch_size": 64,
+            "buffer_capacity": 10000,
+            "label": "h[64,64]_b64_c10k",
+        },
+        {
+            "hidden_dims": [64, 64],
+            "batch_size": 32,
+            "buffer_capacity": 5000,
+            "label": "h[64,64]_b32_c5k",
+        },
+        {
+            "hidden_dims": [64, 64],
+            "batch_size": 32,
+            "buffer_capacity": 20000,
+            "label": "h[64,64]_b32_c20k",
+        },
+        {
+            "hidden_dims": [32],
+            "batch_size": 16,
+            "buffer_capacity": 5000,
+            "label": "h[32]_b16_c5k",
+        },
+        {
+            "hidden_dims": [128, 128],
+            "batch_size": 64,
+            "buffer_capacity": 20000,
+            "label": "h[128,128]_b64_c20k",
+        },
+    ]
+
+    plot_dir = "plots"
+    os.makedirs(plot_dir, exist_ok=True)
+
+    env_name_sanitized = cfg.env.name.lower().replace("-", "_").replace("/", "_")
+
+    for exp_config in experiment_configurations:
+        hidden_dims = exp_config["hidden_dims"]
+        batch_size = exp_config["batch_size"]
+        buffer_capacity = exp_config["buffer_capacity"]
+        config_label = exp_config["label"]
+
+        print(
+            f"\nTraining with config: {config_label} (HiddenDims: {hidden_dims}, BatchSize: {batch_size}, BufferCap: {buffer_capacity})"
+        )
+
+        env = gym.make(cfg.env.name)
+
+        agent = DQNAgent(
+            env,
+            buffer_capacity=buffer_capacity,
+            batch_size=batch_size,
+            lr=cfg.agent.learning_rate,
+            gamma=cfg.agent.gamma,
+            epsilon_start=cfg.agent.epsilon_start,
+            epsilon_final=cfg.agent.epsilon_final,
+            epsilon_decay=cfg.agent.epsilon_decay,
+            target_update_freq=cfg.agent.target_update_freq,
+            seed=cfg.seed,
+            hidden_dims=hidden_dims,
+        )
+        frames_history, avg_rewards_history = agent.train(
+            num_frames=cfg.train.num_frames,
+            eval_interval=cfg.train.eval_interval,
+        )
+
+        plt.figure()
+        plt.plot(frames_history, avg_rewards_history)
+        plt.xlabel("Frames")
+        plt.ylabel("Average Reward (Last 10 Episodes)")
+
+        plot_title = f"DQN ({config_label}) on {cfg.env.name}"
+        plt.title(plot_title)
+
+        plot_filename = os.path.join(
+            plot_dir, f"dqn_{env_name_sanitized}_{config_label}_training_curve.png"
+        )
+
+        plt.savefig(plot_filename)
+        print(f"Plot saved to {plot_filename}")
+        plt.close()
 
 
 if __name__ == "__main__":
